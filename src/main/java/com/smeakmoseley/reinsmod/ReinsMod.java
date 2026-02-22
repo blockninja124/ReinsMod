@@ -1,13 +1,13 @@
 package com.smeakmoseley.reinsmod;
 
 import com.mojang.logging.LogUtils;
-import com.smeakmoseley.reinsmod.event.ShipLeashPhysicsTick;
 import com.smeakmoseley.reinsmod.item.ModItems;
 import com.smeakmoseley.reinsmod.network.NetworkHandler;
-import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.fml.loading.FMLEnvironment;
 import org.slf4j.Logger;
 
 @Mod(ReinsMod.MODID)
@@ -22,6 +22,18 @@ public class ReinsMod {
         ModItems.register(modEventBus);
         NetworkHandler.init();
 
-        LOGGER.info("ReinsMod loaded");
+        // ✅ Only attempt client bootstrap on client, and do it via reflection so the server never links client classes.
+        if (FMLEnvironment.dist == Dist.CLIENT) {
+            try {
+                Class.forName("com.smeakmoseley.reinsmod.client.ClientBootstrap")
+                        .getMethod("init")
+                        .invoke(null);
+                LOGGER.info("[ReinsMod] ClientBootstrap initialized");
+            } catch (Throwable t) {
+                LOGGER.error("[ReinsMod] Failed to init client bootstrap", t);
+            }
+        }
+
+        LOGGER.info("[ReinsMod] Loaded");
     }
 }

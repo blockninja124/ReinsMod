@@ -12,20 +12,22 @@ import java.util.Optional;
 public class ShipLeashDetection {
 
     public static Optional<ShipLeashInfo> detectFenceOnShip(Animal animal) {
-
         if (!(animal.level() instanceof ServerLevel level)) return Optional.empty();
 
         Entity holder = animal.getLeashHolder();
         if (!(holder instanceof LeashFenceKnotEntity knot)) return Optional.empty();
 
         BlockPos fencePos = knot.blockPosition();
-        Vec3 anchorPos = knot.position();
+        Vec3 knotPosRaw = knot.position();
 
-        // 🔑 Must actually be managed by a ship at the knot position
-        if (VsShipAccess.getShipManagingPos(level, anchorPos).isEmpty()) {
-            return Optional.empty();
+        // Try both: knot pos and fence center
+        Object ship = VsShipAccess.getShipManagingPos(level, knotPosRaw).orElse(null);
+        if (ship == null) {
+            ship = VsShipAccess.getShipManagingPos(level, Vec3.atCenterOf(fencePos)).orElse(null);
         }
+        if (ship == null) return Optional.empty();
 
-        return Optional.of(new ShipLeashInfo(animal, fencePos, anchorPos));
+        // IMPORTANT: store raw; later code already tries both interpretations
+        return Optional.of(new ShipLeashInfo(animal, fencePos, knotPosRaw));
     }
 }

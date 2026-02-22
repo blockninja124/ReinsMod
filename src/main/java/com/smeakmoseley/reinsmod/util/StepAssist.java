@@ -8,6 +8,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 public final class StepAssist {
+    private static final boolean DEBUG = false;
+
     private static final Logger LOGGER = LogUtils.getLogger();
 
     private static volatile boolean RESOLVED = false;
@@ -40,11 +42,13 @@ public final class StepAssist {
             c = c.getSuperclass();
         }
 
-        LOGGER.info("[ReinsMod] StepAssist resolved: setMethod={} getMethod={} field={}",
-                (SET_MAX_UP_STEP != null),
-                (GET_MAX_UP_STEP != null),
-                (MAX_UP_STEP_FIELD != null ? MAX_UP_STEP_FIELD.getName() : "null")
-        );
+        if (DEBUG) {
+            LOGGER.info("[ReinsMod] StepAssist resolved: setMethod={} getMethod={} field={}",
+                    (SET_MAX_UP_STEP != null),
+                    (GET_MAX_UP_STEP != null),
+                    (MAX_UP_STEP_FIELD != null ? MAX_UP_STEP_FIELD.getName() : "null")
+            );
+        }
     }
 
     /** Returns current step value, or -1 if unknown */

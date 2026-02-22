@@ -1,146 +1,363 @@
 package com.smeakmoseley.reinsmod.vs;
 
+import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
+import org.slf4j.Logger;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Iterator;
 import java.util.Locale;
 import java.util.Optional;
 
+/**
+ * Dedicated-server safe ship lookup for Valkyrien Skies.
+ *
+ * IMPORTANT:
+ *  - Do NOT load VS utility *Kt classes (they may reference client-only Minecraft classes).
+ *  - Do NOT enumerate methods on those utilities.
+ *
+ * This implementation relies on the fact that in many VS builds, ServerLevel/Level is mixed in
+ * with a direct instance getter:
+ *     level.getShipObjectWorld()
+ * Kotlin can still call this as `level.shipObjectWorld` (property syntax), which matches your
+ * Weather2Compat snippet.
+ */
 public final class VsShipAccess {
+    private static final Logger LOGGER = LogUtils.getLogger();
 
     private enum PosKind { BLOCKPOS, VEC3, JOML3D }
 
-    private static volatile Method SHIP_LOOKUP;
-    private static volatile PosKind LOOKUP_KIND;
+    private static volatile boolean RESOLVED = false;
 
-    // Try a few known VS entrypoints. If your VS build uses a different one,
-    // we still refuse to guess (because guessing is what caused shipify calls).
-    private static final String[] VS_UTIL_CANDIDATES = {
-            "org.valkyrienskies.mod.common.VSGameUtilsKt",
-            "org.valkyrienskies.mod.common.util.VSGameUtilsKt",
-            "org.valkyrienskies.mod.common.ship_handling.VSGameUtilsKt",
-            "org.valkyrienskies.api.ValkyrienSkies"
-    };
+    // Level/ServerLevel -> ShipObjectWorld
+    private static volatile Method GET_SHIP_OBJECT_WORLD = null;
+
+    // ShipObjectWorld -> ship lookup (optional)
+    private static volatile Method SOW_LOOKUP = null;
+    private static volatile PosKind SOW_LOOKUP_KIND = null;
+
+    // ShipObjectWorld -> loadedShips (fallback)
+    private static volatile Method SOW_GET_LOADED_SHIPS = null;
 
     private VsShipAccess() {}
 
     public static Optional<Object> getShipManagingPos(ServerLevel level, Vec3 worldPos) {
-        try {
-            Method m = SHIP_LOOKUP;
-            PosKind kind = LOOKUP_KIND;
+        if (level == null || worldPos == null) return Optional.empty();
 
-            if (m == null || kind == null) {
-                Lookup found = findShipLookupMethod();
-                if (found == null) return Optional.empty();
-                SHIP_LOOKUP = found.method;
-                LOOKUP_KIND = found.kind;
-                m = found.method;
-                kind = found.kind;
-            }
+        ensureResolved(level);
 
-            Object result;
-            if (kind == PosKind.VEC3) {
-                result = m.invoke(null, level, worldPos);
-            } else if (kind == PosKind.JOML3D) {
-                result = m.invoke(null, level, new Vector3d(worldPos.x, worldPos.y, worldPos.z));
-            } else {
-                result = m.invoke(null, level, BlockPos.containing(worldPos));
-            }
+        Object sow = getShipObjectWorld(level);
+        if (sow == null) return Optional.empty();
 
-            if (result == null) return Optional.empty();
-            if (result instanceof Optional<?> opt) return opt.map(o -> (Object) o);
-            return Optional.of(result);
+        // 1) Prefer a direct lookup method if present
+        Object ship = tryLookupOnSow(sow, level, worldPos);
+        if (ship != null) return Optional.of(ship);
 
-        } catch (Throwable ignored) {
-            return Optional.empty();
-        }
+        // 2) Fallback: nearest from loadedShips (works for leash knot/fence use-case)
+        ship = tryNearestFromLoadedShips(sow, worldPos);
+        if (ship != null) return Optional.of(ship);
+
+        return Optional.empty();
     }
 
     public static Optional<Object> getShipManagingPos(ServerLevel level, BlockPos pos) {
+        if (level == null || pos == null) return Optional.empty();
         return getShipManagingPos(level, Vec3.atCenterOf(pos));
     }
 
-    private record Lookup(Method method, PosKind kind) {}
+    // ------------------------------------------------------------
+    // Resolution
+    // ------------------------------------------------------------
 
-    private static Lookup findShipLookupMethod() {
-        for (String cn : VS_UTIL_CANDIDATES) {
-            Class<?> util;
-            try {
-                util = Class.forName(cn);
-            } catch (ClassNotFoundException e) {
-                continue;
+    private static void ensureResolved(ServerLevel level) {
+        if (RESOLVED) return;
+        synchronized (VsShipAccess.class) {
+            if (RESOLVED) return;
+
+            // 1) Bind level.getShipObjectWorld() by walking class chain
+            GET_SHIP_OBJECT_WORLD = findNoArgMethod(level.getClass(), "getShipObjectWorld");
+
+            Object sow = (GET_SHIP_OBJECT_WORLD != null) ? getShipObjectWorld(level) : null;
+
+            if (GET_SHIP_OBJECT_WORLD != null) {
+                LOGGER.info("[ReinsMod VS] Bound Level.getShipObjectWorld() on {}", level.getClass().getName());
+            } else {
+                LOGGER.warn("[ReinsMod VS] Could not find getShipObjectWorld() on ServerLevel/Level class chain.");
             }
 
-            Method best = null;
-            PosKind bestKind = null;
-            int bestScore = Integer.MIN_VALUE;
+            // 2) If we got SOW, resolve optional lookup + loadedShips access
+            if (sow != null) {
+                resolveSowMethods(sow.getClass());
+            } else {
+                SOW_LOOKUP = null;
+                SOW_LOOKUP_KIND = null;
+                SOW_GET_LOADED_SHIPS = null;
+            }
 
-            for (Method m : util.getMethods()) {
-                if (!Modifier.isStatic(m.getModifiers())) continue;
+            if (SOW_LOOKUP != null) {
+                LOGGER.info("[ReinsMod VS] ShipObjectWorld lookup bound: {}.{}({})",
+                        SOW_LOOKUP.getDeclaringClass().getName(),
+                        SOW_LOOKUP.getName(),
+                        SOW_LOOKUP.getParameterTypes()[0].getSimpleName());
+            } else {
+                LOGGER.warn("[ReinsMod VS] ShipObjectWorld lookup method NOT resolved (will use loadedShips fallback).");
+            }
 
-                String name = m.getName().toLowerCase(Locale.ROOT);
+            if (SOW_GET_LOADED_SHIPS != null) {
+                LOGGER.info("[ReinsMod VS] ShipObjectWorld loadedShips getter bound: {}.{}()",
+                        SOW_GET_LOADED_SHIPS.getDeclaringClass().getName(),
+                        SOW_GET_LOADED_SHIPS.getName());
+            } else {
+                LOGGER.warn("[ReinsMod VS] ShipObjectWorld loadedShips getter NOT resolved (cannot fallback).");
+            }
 
-                // 🚫 Never ever call side-effect helpers
-                if (name.contains("shipify")) continue;
-                if (name.contains("create")) continue;
-                if (name.contains("construct")) continue;
-                if (name.contains("assemble")) continue;
-                if (name.contains("spawn")) continue;
-                if (name.contains("build")) continue;
-                if (name.contains("generate")) continue;
-                if (name.contains("convert")) continue;
+            RESOLVED = true;
+        }
+    }
 
-                // ✅ MUST be a managing-ship lookup (hard requirement)
-                if (!name.contains("get")) continue;
-                if (!name.contains("ship")) continue;
-                if (!name.contains("managing")) continue;   // <— KEY
+    private static Method findNoArgMethod(Class<?> start, String name) {
+        Class<?> c = start;
+        while (c != null) {
+            try {
+                Method m = c.getMethod(name);
+                m.setAccessible(true);
+                return m;
+            } catch (Throwable ignored) {}
+            try {
+                Method m = c.getDeclaredMethod(name);
+                m.setAccessible(true);
+                return m;
+            } catch (Throwable ignored) {}
+            c = c.getSuperclass();
+        }
+        return null;
+    }
 
-                Class<?>[] p = m.getParameterTypes();
-                if (p.length != 2) continue;
+    private static Object getShipObjectWorld(ServerLevel level) {
+        if (GET_SHIP_OBJECT_WORLD == null) return null;
+        try {
+            return GET_SHIP_OBJECT_WORLD.invoke(level);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
 
-                // ✅ Correct direction
-                if (!ServerLevel.class.isAssignableFrom(p[0])) continue;
+    private static void resolveSowMethods(Class<?> sowClass) {
+        // Try exact signatures only (no enumeration)
 
-                PosKind kind = classifyPosParam(p[1]);
-                if (kind == null) continue;
+        // --- direct lookup methods on SOW ---
+        // Common names across builds:
+        String[] names = {"getShipManagingPos", "getShipAtPos", "getShipAtPosition", "getShipAt"};
 
-                if (m.getReturnType() == void.class) continue;
+        // A) (Vec3)
+        for (String n : names) {
+            Method m = tryInstance(sowClass, n, Vec3.class);
+            if (m != null) { SOW_LOOKUP = m; SOW_LOOKUP_KIND = PosKind.VEC3; break; }
+        }
 
-                int score = 0;
-                // Prefer exact-ish names
-                if (name.contains("managingpos")) score += 100;
-                if (name.equals("getshipmanagingpos")) score += 200;
-                if (kind == PosKind.VEC3) score += 10;
-                if (kind == PosKind.JOML3D) score += 8;
+        // B) (BlockPos)
+        if (SOW_LOOKUP == null) {
+            for (String n : names) {
+                Method m = tryInstance(sowClass, n, BlockPos.class);
+                if (m != null) { SOW_LOOKUP = m; SOW_LOOKUP_KIND = PosKind.BLOCKPOS; break; }
+            }
+        }
 
-                // Prefer Optional return type
-                if (Optional.class.isAssignableFrom(m.getReturnType())) score += 25;
+        // C) (Vector3dc)
+        if (SOW_LOOKUP == null) {
+            Class<?> v3dc = tryLoad("org.joml.Vector3dc");
+            if (v3dc != null) {
+                for (String n : names) {
+                    Method m = tryInstance(sowClass, n, v3dc);
+                    if (m != null) { SOW_LOOKUP = m; SOW_LOOKUP_KIND = PosKind.JOML3D; break; }
+                }
+            }
+        }
 
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = m;
-                    bestKind = kind;
+        // D) Some builds might require (Level, Vec3) or (ServerLevel, Vec3)
+        if (SOW_LOOKUP == null) {
+            for (String n : names) {
+                Method m = tryInstance(sowClass, n, Level.class, Vec3.class);
+                if (m != null) { SOW_LOOKUP = m; SOW_LOOKUP_KIND = PosKind.VEC3; break; }
+            }
+        }
+        if (SOW_LOOKUP == null) {
+            for (String n : names) {
+                Method m = tryInstance(sowClass, n, ServerLevel.class, Vec3.class);
+                if (m != null) { SOW_LOOKUP = m; SOW_LOOKUP_KIND = PosKind.VEC3; break; }
+            }
+        }
+
+        // --- loadedShips getter (fallback) ---
+        Method ls = tryInstanceNoArgs(sowClass, "getLoadedShips");
+        if (ls == null) ls = tryInstanceNoArgs(sowClass, "loadedShips");
+        if (ls == null) ls = tryInstanceNoArgs(sowClass, "getShips");
+        if (ls == null) ls = tryInstanceNoArgs(sowClass, "ships");
+        SOW_GET_LOADED_SHIPS = ls;
+    }
+
+    private static Method tryInstance(Class<?> owner, String name, Class<?>... params) {
+        try {
+            Method m = owner.getMethod(name, params);
+            if (Modifier.isStatic(m.getModifiers())) return null;
+            m.setAccessible(true);
+            return m;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Method tryInstanceNoArgs(Class<?> owner, String name) {
+        return tryInstance(owner, name);
+    }
+
+    private static Class<?> tryLoad(String cn) {
+        try { return Class.forName(cn); } catch (Throwable t) { return null; }
+    }
+
+    // ------------------------------------------------------------
+    // Using ShipObjectWorld
+    // ------------------------------------------------------------
+
+    private static Object tryLookupOnSow(Object sow, ServerLevel level, Vec3 worldPos) {
+        if (sow == null || SOW_LOOKUP == null) return null;
+
+        try {
+            Object result;
+
+            Class<?>[] p = SOW_LOOKUP.getParameterTypes();
+            // Handle either (pos) or (level, pos)
+            if (p.length == 1) {
+                result = switch (SOW_LOOKUP_KIND) {
+                    case VEC3 -> SOW_LOOKUP.invoke(sow, worldPos);
+                    case JOML3D -> SOW_LOOKUP.invoke(sow, new Vector3d(worldPos.x, worldPos.y, worldPos.z));
+                    case BLOCKPOS -> SOW_LOOKUP.invoke(sow, BlockPos.containing(worldPos));
+                };
+            } else if (p.length == 2) {
+                Object posArg = switch (SOW_LOOKUP_KIND) {
+                    case VEC3 -> worldPos;
+                    case JOML3D -> new Vector3d(worldPos.x, worldPos.y, worldPos.z);
+                    case BLOCKPOS -> BlockPos.containing(worldPos);
+                };
+                result = SOW_LOOKUP.invoke(sow, level, posArg);
+            } else {
+                return null;
+            }
+
+            if (result == null) return null;
+            if (result instanceof Optional<?> opt) return opt.orElse(null);
+            return result;
+
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object tryNearestFromLoadedShips(Object sow, Vec3 worldPos) {
+        if (sow == null || SOW_GET_LOADED_SHIPS == null) return null;
+
+        try {
+            Object loaded = SOW_GET_LOADED_SHIPS.invoke(sow);
+            if (loaded == null) return null;
+
+            Iterable<?> it = asIterable(loaded);
+            if (it == null) return null;
+
+            Object bestShip = null;
+            double bestD2 = Double.POSITIVE_INFINITY;
+
+            for (Object ship : it) {
+                if (ship == null) continue;
+
+                Vec3 shipPos = tryShipWorldPos(ship);
+                if (shipPos == null) continue;
+
+                double dx = shipPos.x - worldPos.x;
+                double dz = shipPos.z - worldPos.z;
+                double d2 = dx * dx + dz * dz;
+
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    bestShip = ship;
                 }
             }
 
-            if (best != null) {
-                best.setAccessible(true);
-                return new Lookup(best, bestKind);
-            }
+            return bestShip;
+
+        } catch (Throwable ignored) {
+            return null;
         }
+    }
+
+    private static Iterable<?> asIterable(Object o) {
+        if (o instanceof Iterable<?> i) return i;
+        if (o != null && o.getClass().isArray()) {
+            return () -> new Iterator<>() {
+                final int len = java.lang.reflect.Array.getLength(o);
+                int idx = 0;
+                @Override public boolean hasNext() { return idx < len; }
+                @Override public Object next() { return java.lang.reflect.Array.get(o, idx++); }
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Best-effort ship WORLD position used for nearest-ship fallback.
+     * Tries common patterns with exact method calls (no enumeration).
+     */
+    private static Vec3 tryShipWorldPos(Object ship) {
+        // getPosition(): Vector3dc or Vector3d
+        try {
+            Method m = ship.getClass().getMethod("getPosition");
+            Object v = m.invoke(ship);
+            Vec3 vv = toVec3(v);
+            if (vv != null) return vv;
+        } catch (Throwable ignored) {}
+
+        // getTransform().getPosition()
+        try {
+            Method gt = ship.getClass().getMethod("getTransform");
+            Object tr = gt.invoke(ship);
+            if (tr != null) {
+                try {
+                    Method gp = tr.getClass().getMethod("getPosition");
+                    Object v = gp.invoke(tr);
+                    Vec3 vv = toVec3(v);
+                    if (vv != null) return vv;
+                } catch (Throwable ignored2) {}
+            }
+        } catch (Throwable ignored) {}
+
+        // shipToWorld + inertia COM path is version-dependent; skip here to avoid heavy reflection.
 
         return null;
     }
 
-    private static PosKind classifyPosParam(Class<?> c) {
-        if (c == BlockPos.class) return PosKind.BLOCKPOS;
-        if (c == Vec3.class) return PosKind.VEC3;
-        String n = c.getName();
-        if (n.equals("org.joml.Vector3d") || n.equals("org.joml.Vector3dc")) return PosKind.JOML3D;
+    private static Vec3 toVec3(Object v) {
+        if (v == null) return null;
+
+        if (v instanceof Vector3d d) return new Vec3(d.x, d.y, d.z);
+
+        // Vector3dc: has x(), y(), z()
+        try {
+            if (v.getClass().getName().equals("org.joml.Vector3dc")) {
+                Method x = v.getClass().getMethod("x");
+                Method y = v.getClass().getMethod("y");
+                Method z = v.getClass().getMethod("z");
+                return new Vec3(
+                        ((Number) x.invoke(v)).doubleValue(),
+                        ((Number) y.invoke(v)).doubleValue(),
+                        ((Number) z.invoke(v)).doubleValue()
+                );
+            }
+        } catch (Throwable ignored) {}
+
         return null;
     }
 }

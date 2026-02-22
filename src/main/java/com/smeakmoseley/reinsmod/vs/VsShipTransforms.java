@@ -21,6 +21,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *  - So we round-trip test to determine which matrix is which.
  */
 public final class VsShipTransforms {
+    private static final boolean DEBUG = false;
+
     private static final Logger LOGGER = LogUtils.getLogger();
 
     private static final Map<Class<?>, Resolved> CACHE = new ConcurrentHashMap<>();
@@ -84,6 +86,9 @@ public final class VsShipTransforms {
 
             return null;
         } catch (Throwable t) {
+            if (DEBUG) {
+                LOGGER.error("[ReinsMod VS] Error converting shipyard to world", t);
+            }
             return null;
         }
     }
@@ -156,14 +161,16 @@ public final class VsShipTransforms {
             if (candA != null) candA.setAccessible(true);
             if (candB != null) candB.setAccessible(true);
 
-            if (getTransform != null) {
-                LOGGER.info("[ReinsMod VS] Transform getter on {}: {}", shipClass.getName(), getTransform.getName());
+            if (DEBUG) {
+                if (getTransform != null) {
+                    LOGGER.info("[ReinsMod VS] Transform getter on {}: {}", shipClass.getName(), getTransform.getName());
+                }
+                LOGGER.info("[ReinsMod VS] Matrix candidates on {}: A={} B={}",
+                        shipClass.getName(),
+                        (candA == null ? "null" : candA.getName()),
+                        (candB == null ? "null" : candB.getName())
+                );
             }
-            LOGGER.info("[ReinsMod VS] Matrix candidates on {}: A={} B={}",
-                    shipClass.getName(),
-                    (candA == null ? "null" : candA.getName()),
-                    (candB == null ? "null" : candB.getName())
-            );
 
             return new Resolved(getTransform, onTransform, candA, candB);
 
@@ -350,13 +357,17 @@ public final class VsShipTransforms {
             if (e2 < e1) {
                 r.shipToWorldGetter = B;
                 r.worldToShipGetter = A;
-                LOGGER.info("[ReinsMod VS] Matrix direction swap: shipToWorld={} worldToShip={} (e1={} e2={})",
-                        B.getName(), A.getName(), fmt(e1), fmt(e2));
+                if (DEBUG) {
+                    LOGGER.info("[ReinsMod VS] Matrix direction swap: shipToWorld={} worldToShip={} (e1={} e2={})",
+                            B.getName(), A.getName(), fmt(e1), fmt(e2));
+                }
             } else {
                 r.shipToWorldGetter = A;
                 r.worldToShipGetter = B;
+                if (DEBUG) {
                 LOGGER.info("[ReinsMod VS] Matrix direction ok: shipToWorld={} worldToShip={} (e1={} e2={})",
-                        A.getName(), B.getName(), fmt(e1), fmt(e2));
+                            A.getName(), B.getName(), fmt(e1), fmt(e2));
+                }
             }
 
             r.decided = true;

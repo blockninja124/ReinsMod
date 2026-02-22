@@ -35,5 +35,21 @@ public class NetworkHandler {
                     ctx.get().setPacketHandled(true);
                 }
         );
+        CHANNEL.registerMessage(
+                1,
+                CruiseControlPacket.class,
+                CruiseControlPacket::encode,
+                CruiseControlPacket::decode,
+                (msg, ctx) -> {
+                    ctx.get().enqueueWork(() -> {
+                        if (ctx.get().getSender() != null) {
+                            com.smeakmoseley.reinsmod.control.CruiseControlLogic.handle(
+                                    ctx.get().getSender(), msg
+                            );
+                        }
+                    });
+                    ctx.get().setPacketHandled(true);
+                }
+        );
     }
 }

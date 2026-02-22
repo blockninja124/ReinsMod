@@ -3,6 +3,6 @@ Specification-Title: reinsmod
 Specification-Vendor: smeakmoseley
 Specification-Version: 1
 Implementation-Title: forge-1.20.1-47.3.11-mdk
-Implementation-Version: 1.0.1
+Implementation-Version: 1.0.3b
 Implementation-Vendor: smeakmoseley
 

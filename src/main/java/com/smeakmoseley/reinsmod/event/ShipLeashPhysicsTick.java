@@ -1,5 +1,6 @@
 package com.smeakmoseley.reinsmod.event;
 
+import com.mojang.logging.LogUtils;
 import com.smeakmoseley.reinsmod.ReinsMod;
 import com.smeakmoseley.reinsmod.capability.reined.ReinedAnimalProvider;
 import com.smeakmoseley.reinsmod.control.ServerControlState;
@@ -7,7 +8,7 @@ import com.smeakmoseley.reinsmod.vs.VsShipAccess;
 import com.smeakmoseley.reinsmod.vs.VsShipForces;
 import com.smeakmoseley.reinsmod.vs.VsShipMass;
 import com.smeakmoseley.reinsmod.vs.VsShipTransforms;
-import net.minecraft.network.chat.Component;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.animal.Animal;
@@ -17,6 +18,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
+import org.slf4j.Logger;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -29,7 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
 )
 public final class ShipLeashPhysicsTick {
 
-    private static final double SCAN_RADIUS = 16.0;
+    private static final double SCAN_RADIUS = 96.0;
 
     // Rope geometry
     private static final double SLACK = 2.5;
@@ -63,11 +65,18 @@ public final class ShipLeashPhysicsTick {
 
     // STOP-INTENT braking (player released movement input)
     // When player is controlling but not giving movement input, brake any forward ship motion along reins.
-    private static final double STOP_BRAKE_GAIN = 2.25;      // stronger than BRAKE_GAIN
+    private static final double STOP_BRAKE_GAIN = 2.6;      // stronger than BRAKE_GAIN
     private static final double STOP_BRAKE_DEADZONE = 0.005; // ignore jitter (blocks/tick)
-    private static final double STOP_MAX_FORCE = 1_500_000.0;
+    private static final double STOP_MAX_FORCE = 2_000_000.0;
 
     private static final double MAX_REASONABLE_DIST = 128.0;
+
+    // --- SHAFT braking (prevents overrunning animals like a carriage shaft) ---
+    private static final double SHAFT_LENGTH = 3.2;        // desired minimum gap (blocks) from anchor to animal
+    private static final double SHAFT_SOFT_ZONE = 1.6;     // ramp distance (blocks) before "hard" shaft
+    private static final double SHAFT_GAIN = 6.0;          // how aggressively it ramps once inside soft zone
+    private static final double SHAFT_DAMP = 2.0;          // damping along travel direction
+    private static final double SHAFT_MAX_FORCE = 3_500_000.0; // cap for shaft brake
 
     // --- commanded speed constants (match ServerAnimalControlTick) ---
     private static final double CMD_WALK_SPEED = 0.20;
@@ -81,8 +90,14 @@ public final class ShipLeashPhysicsTick {
 
     private static final ConcurrentHashMap<UUID, Double> LAST_PULL_FORCE = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<UUID, Integer> LAST_BAD_ANCHOR_TICK = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, Double> LAST_SHAFT_BRAKE = new ConcurrentHashMap<>();
 
+    // ✅ Turn on for debugging
     private static final boolean DEBUG = false;
+
+    private static final int CRUISE_TIMEOUT_TICKS = 20 * 60; // 60 seconds
+
+    private static final Logger LOGGER = LogUtils.getLogger();
 
     private ShipLeashPhysicsTick() {}
 
@@ -91,11 +106,10 @@ public final class ShipLeashPhysicsTick {
         if (event.phase != TickEvent.Phase.END) return;
         if (!(event.level instanceof ServerLevel level)) return;
 
-        // 🔹 Performance: run at 10 Hz instead of 20 Hz (remove this line if undesired)
+        // Run every other tick
         if ((level.getServer().getTickCount() & 1) != 0) return;
 
         int nowTick = level.getServer().getTickCount();
-
         Set<Integer> seen = new HashSet<>();
 
         for (ServerPlayer player : level.players()) {
@@ -109,57 +123,71 @@ public final class ShipLeashPhysicsTick {
                     if (!cap.isLeashedToShip()) return;
                     if (!animal.isLeashed()) return;
 
-                    if (!(animal.getLeashHolder() instanceof LeashFenceKnotEntity knot)) {
-                        cleanup(animal);
-                        return;
+                    if (!(animal.getLeashHolder() instanceof LeashFenceKnotEntity knot)) return;
+
+                    if (DEBUG && nowTick % 40 == 0) {
+                        LOGGER.info("[ReinsMod] ShipLeashPhysicsTick sees leashed animal={} hasReins={} leashedToShip={} owner={}",
+                                animal.getUUID(),
+                                cap.hasReins(),
+                                cap.isLeashedToShip(),
+                                cap.getOwner());
                     }
 
                     Vec3 knotPos = knot.position();
 
-                    Vec3 animalPosStable = new Vec3(
-                            animal.position().x,
-                            knotPos.y,
-                            animal.position().z
-                    );
-
+                    // Try ship lookup at knot position, then at the fence block center as fallback
+                    Vec3 fenceCenterWorld = Vec3.atCenterOf(knot.blockPosition());
                     Object ship0 = VsShipAccess.getShipManagingPos(level, knotPos).orElse(null);
+                    if (ship0 == null) {
+                        ship0 = VsShipAccess.getShipManagingPos(level, fenceCenterWorld).orElse(null);
+                    }
                     if (ship0 == null) return;
 
-                    AnchorSolve solved = resolveAnchorWorld(level, ship0, knotPos, animalPosStable);
-                    if (!solved.ok || solved.anchorWorld == null) {
-                        maybeWarnBadAnchor(player, animal.getUUID(), knotPos, cap.getShipAnchorPos());
+                    // --- IMPORTANT: minimal dedicated-server fix (NO physics/feel changes) ---
+                    // Dedicated can report knotPos in a non-world space (shipyard/physics). We *only* fix anchor resolution.
+                    // We also prefer the capability anchor/fence if present (these are what you set when leashing to ship),
+                    // which keeps behavior identical to single-player.
+                    Vec3 capAnchor = cap.getShipAnchorPos(); // may be null
+                    BlockPos capFence = cap.getShipFencePos(); // may be null
+                    Vec3 capFenceCenter = capFence != null ? Vec3.atCenterOf(capFence) : null;
+
+                    AnchorSolve solved = resolveAnchorWorld(level, ship0, knotPos, fenceCenterWorld, capAnchor, capFenceCenter, animal.position());
+                    if (!solved.ok) {
+                        maybeWarnBadAnchor(player, animal.getUUID(), knotPos, capAnchor, fenceCenterWorld, solved.mode);
                         return;
                     }
 
-                    Vec3 anchorWorld = solved.anchorWorld;
                     Object ship = solved.shipObj;
+                    Vec3 anchorWorld = solved.anchorWorld;
 
                     Vec3 delta = animal.position().subtract(anchorWorld);
                     delta = new Vec3(delta.x, 0.0, delta.z);
                     double dist = delta.length();
-                    if (dist < 1.0e-6) return;
+                    if (dist < 1.0e-6 || dist > MAX_REASONABLE_DIST) return;
 
                     Vec3 dir = delta.scale(1.0 / dist);
 
                     UUID owner = cap.getOwner();
                     ServerControlState.Control ctl = (owner == null)
                             ? null
-                            : ServerControlState.getRecent(owner, nowTick, 5);
+                            : ServerControlState.getRecentOrCruise(owner, nowTick, 5, CRUISE_TIMEOUT_TICKS);
 
-                    boolean playerControlled = (ctl != null);
+                    boolean playerControlled = ctl != null;
 
                     double commandedSpeed = 0.0;
                     double inputMag = 0.0;
 
                     if (playerControlled) {
-                        inputMag = Math.sqrt(
-                                (double) ctl.forward * ctl.forward +
-                                (double) ctl.strafe * ctl.strafe
-                        );
-                        if (inputMag > 1.0) inputMag = 1.0;
+                        if (ctl.cruiseEnabled) {
+                            inputMag = 1.0;
+                            commandedSpeed = CMD_WALK_SPEED * (ctl.cruiseSprint ? CMD_SPRINT_MULT : 1.0);
+                        } else {
+                            inputMag = Math.sqrt((double) ctl.forward * ctl.forward + (double) ctl.strafe * ctl.strafe);
+                            if (inputMag > 1.0) inputMag = 1.0;
 
-                        double mult = ctl.sprint ? CMD_SPRINT_MULT : 1.0;
-                        commandedSpeed = CMD_WALK_SPEED * mult * inputMag;
+                            double mult = ctl.sprint ? CMD_SPRINT_MULT : 1.0;
+                            commandedSpeed = CMD_WALK_SPEED * mult * inputMag;
+                        }
                     }
 
                     boolean hasInput = playerControlled && inputMag > INPUT_MAG_EPS;
@@ -176,116 +204,139 @@ public final class ShipLeashPhysicsTick {
                     double shipMass = VsShipMass.getShipMass(ship);
                     if (shipMass <= 0) shipMass = 20_000.0;
 
-                    // =========================
-                    // STOP INTENT (hard brake)
-                    // =========================
-                    if (playerControlled && !hasInput) {
-                        UUID key = animal.getUUID();
+                    boolean cruiseEnabled = (ctl != null && ctl.cruiseEnabled);
+                    boolean hasDriveIntent = cruiseEnabled || hasInput;
 
+                    // Only brake when there is NO intent to move
+                    if (!hasDriveIntent) {
+                        // Travel direction: where the ship is currently moving in XZ
                         Vec3 vXZ = new Vec3(shipVelWorldPerSec.x, 0.0, shipVelWorldPerSec.z);
                         double speed = vXZ.length();
 
-                        if (speed > 0.02) {
-                            final double STOP_VEL_GAIN = 6.0;
-                            final double STOP_MAX_FORCE_LOCAL = 2_500_000.0;
+                        if (speed > STOP_BRAKE_DEADZONE) {
+                            Vec3 travelDir = vXZ.scale(1.0 / speed);
 
-                            Vec3 dirBrake = vXZ.scale(1.0 / speed);
-                            double brakeMag = shipMass * speed * STOP_VEL_GAIN;
-                            brakeMag = Math.min(brakeMag, STOP_MAX_FORCE_LOCAL);
+                            // Shaft logic: are we moving toward the animal?
+                            Vec3 toAnimal = new Vec3(
+                                    animal.position().x - anchorWorld.x,
+                                    0.0,
+                                    animal.position().z - anchorWorld.z
+                            );
+                            double gap = toAnimal.length();
 
+                            if (gap > 1.0e-6) {
+                                Vec3 toAnimalDir = toAnimal.scale(1.0 / gap);
+
+                                double closing = travelDir.dot(toAnimalDir);
+
+                                if (closing > 0.15) {
+                                    double penetration = (SHAFT_LENGTH + SHAFT_SOFT_ZONE) - gap;
+
+                                    if (penetration > 0.0) {
+                                        double t = Math.min(1.0, penetration / SHAFT_SOFT_ZONE);
+                                        double ramp = t * t;
+
+                                        double vAlong = vXZ.dot(travelDir);
+                                        double damp = SHAFT_DAMP * vAlong;
+
+                                        double baseBrake = shipMass * speed * STOP_BRAKE_GAIN;
+                                        double shaftExtra = shipMass * (SHAFT_GAIN * ramp) * speed + shipMass * damp;
+
+                                        double targetBrake = Math.min(baseBrake + shaftExtra, SHAFT_MAX_FORCE);
+
+                                        UUID key = animal.getUUID();
+                                        double prev = LAST_SHAFT_BRAKE.getOrDefault(key, targetBrake);
+                                        double applied = prev + (targetBrake - prev) * 0.65;
+                                        LAST_SHAFT_BRAKE.put(key, applied);
+
+                                        VsShipForces.applyWorldForce(ship, travelDir.scale(-applied), null);
+
+                                        LAST_PULL_FORCE.put(key, 0.0);
+                                        return;
+                                    }
+                                }
+                            }
+
+                            // Fallback: normal stop brake if not in shaft zone / not closing
+                            Vec3 dirBrake = travelDir;
+                            double brakeMag = Math.min(shipMass * speed * STOP_BRAKE_GAIN, STOP_MAX_FORCE);
                             VsShipForces.applyWorldForce(ship, dirBrake.scale(-brakeMag), null);
                         }
 
-                        LAST_PULL_FORCE.put(key, 0.0);
+                        LAST_PULL_FORCE.put(animal.getUUID(), 0.0);
                         return;
                     }
 
-                    double allowedAlong;
-                    if (playerControlled) {
-                        allowedAlong = Math.max(commandedSpeed, Math.max(0.0, animalSpeedAlong));
-                    } else {
-                        allowedAlong = Math.max(0.0, animalSpeedAlong);
-                    }
-                    allowedAlong += VELOCITY_EPS;
+                    double allowedAlong = Math.max(commandedSpeed, Math.max(0.0, animalSpeedAlong)) + VELOCITY_EPS;
 
                     double hi = allowedAlong + SPEED_HYST;
                     double lo = Math.max(0.0, allowedAlong - SPEED_HYST);
 
                     UUID key = animal.getUUID();
 
-                    // =========================
-                    // BRAKE
-                    // =========================
+                    // If ship is going too fast along reins direction, brake
                     if (shipSpeedAlong > hi) {
                         double excess = shipSpeedAlong - allowedAlong;
                         double brakeMag = Math.min(excess * shipMass * BRAKE_GAIN, MAX_FORCE);
-
                         VsShipForces.applyWorldForce(ship, dir.scale(-brakeMag), null);
                         LAST_PULL_FORCE.put(key, 0.0);
                         return;
                     }
 
-                    // =========================
-                    // HOLD
-                    // =========================
+                    // If within hysteresis band, do nothing
                     if (shipSpeedAlong >= lo) {
                         LAST_PULL_FORCE.put(key, 0.0);
                         return;
                     }
 
-                    // =========================
-                    // PULL
-                    // =========================
                     double minForce = Math.max(1.0, shipMass * MIN_FORCE_MASS_MULT);
                     double targetForce = 0.0;
 
-                    if (playerControlled && hasInput) {
-                        double intent = Math.max(0.0, commandedSpeed);
+                    if (playerControlled && (hasInput || ctl.cruiseEnabled)) {
+                        double shipTons = shipMass / 1000.0;
+                        double intentBase = commandedSpeed * BASE_INTENT_FORCE_PER_TON;
+                        double massFactor = Math.pow(shipTons, INTENT_FORCE_MASS_EXPONENT);
 
-                        if (intent < 0.08 && shipSpeedAlong < 0.15) {
-                            intent = Math.max(intent, 0.12);
-                        }
+                        double intentForce = Math.min(
+                                MAX_INTENT_FORCE,
+                                Math.max(MIN_INTENT_FORCE, intentBase * massFactor)
+                        );
 
-                        if (intent > 0.01) {
-                            double shipTons = shipMass / 1000.0;
-                            double intentBase = intent * BASE_INTENT_FORCE_PER_TON;
-                            double massFactor = Math.pow(shipTons, INTENT_FORCE_MASS_EXPONENT);
+                        double stretchForce = Math.max(0.0, stretch) * SPRING * 6.0;
+                        targetForce = Math.max(intentForce + stretchForce, minForce);
 
-                            double intentForce = Math.min(
-                                    MAX_INTENT_FORCE,
-                                    Math.max(MIN_INTENT_FORCE, intentBase * massFactor)
-                            );
-
-                            double stretchForce = Math.max(0.0, stretch) * SPRING * 6.0;
-                            targetForce = Math.max(intentForce + stretchForce, minForce);
-                        }
                     } else if (stretch > 0.0) {
                         double relVel = animalVel.dot(dir);
                         targetForce = Math.max((stretch * SPRING) + (relVel * DAMPING), 0.0);
                     }
 
-                    double prev = LAST_PULL_FORCE.getOrDefault(key, targetForce);
-                    double smoothed = prev + (targetForce - prev) * FORCE_SMOOTHING;
+                    double prevForce = LAST_PULL_FORCE.getOrDefault(key, targetForce);
+                    double smoothed = prevForce + (targetForce - prevForce) * FORCE_SMOOTHING;
 
-                    double rateLimit = shipMass < 80_000
-                            ? FORCE_RATE_LIMIT_MULT_LIGHT
-                            : FORCE_RATE_LIMIT_MULT_HEAVY;
-
+                    double rateLimit = shipMass < 80_000 ? FORCE_RATE_LIMIT_MULT_LIGHT : FORCE_RATE_LIMIT_MULT_HEAVY;
                     double maxDelta = shipMass * rateLimit;
-                    double df = Math.max(-maxDelta, Math.min(maxDelta, smoothed - prev));
+                    double df = Math.max(-maxDelta, Math.min(maxDelta, smoothed - prevForce));
 
-                    double forceMag = Math.min(MAX_FORCE, Math.max(0.0, prev + df));
+                    double forceMag = Math.min(MAX_FORCE, Math.max(0.0, prevForce + df));
                     LAST_PULL_FORCE.put(key, forceMag);
 
                     if (forceMag > 0.0) {
-                        VsShipForces.applyWorldForce(ship, dir.scale(forceMag), anchorWorld);
+                        boolean ok = VsShipForces.applyWorldForce(ship, dir.scale(forceMag), anchorWorld);
+
+                        if (DEBUG && nowTick % 20 == 0) {
+                            LOGGER.info("[ReinsMod VS] applyWorldForce ok={} summary={} forceMag={} mode={} dist={}",
+                                    ok, VsShipForces.resolutionSummary(), forceMag, solved.mode, dist);
+                        }
                     }
                 });
             }
         }
     }
 
-    // Anchor resolution helpers (unchanged)
+    // ------------------------------------------------------------
+    // Anchor resolution helpers (ONLY change vs original feel)
+    // ------------------------------------------------------------
+
     private static final class AnchorSolve {
         final boolean ok;
         final Vec3 anchorWorld;
@@ -307,20 +358,65 @@ public final class ShipLeashPhysicsTick {
         double dist = Double.POSITIVE_INFINITY;
     }
 
-    private static AnchorSolve resolveAnchorWorld(ServerLevel level, Object ship0, Vec3 knotPos, Vec3 animalWorldPos) {
+    private static final double HUGE_COORD = 1_000_000.0;
+
+    private static boolean looksNonWorld(Vec3 p) {
+        if (p == null) return true;
+        return Math.abs(p.x) > HUGE_COORD || Math.abs(p.z) > HUGE_COORD || !Double.isFinite(p.x) || !Double.isFinite(p.z);
+    }
+
+    /**
+     * Dedicated-server-safe anchor resolution, without changing leash feel:
+     *
+     * 1) Prefer capability anchor/fence (these are what your mod recorded when leashing)
+     * 2) Try shipyard->world transform for knotPos / fenceCenter (dedicated often stores knot in shipyard space)
+     * 3) As a last resort, accept raw knotPos/fenceCenter if they look world-ish
+     *
+     * We pick the candidate with smallest horizontal distance to the animal.
+     */
+    private static AnchorSolve resolveAnchorWorld(
+            ServerLevel level,
+            Object ship0,
+            Vec3 knotPos,
+            Vec3 fenceCenterWorld,
+            Vec3 capAnchorWorld,
+            Vec3 capFenceCenterWorld,
+            Vec3 animalWorldPos
+    ) {
         BestAnchor best = new BestAnchor();
 
-        considerAnchor(level, ship0, animalWorldPos,
-                VsShipTransforms.shipyardToWorld(ship0, knotPos),
-                "knot_as_shipyard", best);
+        // (1) Prefer capability stored positions (keeps behavior closest to SP)
+        considerAnchor(level, ship0, animalWorldPos, capAnchorWorld, "cap_anchor_world", best);
+        considerAnchor(level, ship0, animalWorldPos, capFenceCenterWorld, "cap_fence_center_world", best);
 
-        considerAnchor(level, ship0, animalWorldPos,
-                knotPos,
-                "knot_as_world", best);
+        // (2) Try shipyard->world transform (works when knot/fence are in shipyard space)
+        try {
+            if (knotPos != null) {
+                Vec3 a = VsShipTransforms.shipyardToWorld(ship0, knotPos);
+                considerAnchor(level, ship0, animalWorldPos, a, "knot_shipyard_to_world", best);
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            if (fenceCenterWorld != null) {
+                Vec3 a = VsShipTransforms.shipyardToWorld(ship0, fenceCenterWorld);
+                considerAnchor(level, ship0, animalWorldPos, a, "fence_shipyard_to_world", best);
+            }
+        } catch (Throwable ignored) {}
+
+        // (3) Only accept raw positions if they look like real world coords (prevents -28 million anchors)
+        if (!looksNonWorld(knotPos)) {
+            considerAnchor(level, ship0, animalWorldPos, knotPos, "knot_as_world", best);
+        }
+        if (!looksNonWorld(fenceCenterWorld)) {
+            considerAnchor(level, ship0, animalWorldPos, fenceCenterWorld, "fence_as_world", best);
+        }
 
         if (best.anchorWorld == null) return new AnchorSolve(false, null, ship0, "no_candidate");
         if (!Double.isFinite(best.dist)) return new AnchorSolve(false, null, ship0, "nan_dist");
+
         if (best.dist > MAX_REASONABLE_DIST) {
+            // If everything is bad, clear transform cache to force re-resolve next time
             VsShipTransforms.clearCacheFor(ship0.getClass());
             return new AnchorSolve(false, best.anchorWorld, best.shipObj, "all_bad:" + best.mode);
         }
@@ -331,11 +427,13 @@ public final class ShipLeashPhysicsTick {
     private static void considerAnchor(ServerLevel level, Object fallbackShip, Vec3 animalWorldPos,
                                        Vec3 anchorWorld, String mode, BestAnchor best) {
         if (anchorWorld == null) return;
+
         Object shipHere = VsShipAccess.getShipManagingPos(level, anchorWorld).orElse(fallbackShip);
 
         Vec3 d = animalWorldPos.subtract(anchorWorld);
         d = new Vec3(d.x, 0.0, d.z);
         double dist = d.length();
+        if (!Double.isFinite(dist)) return;
 
         if (dist < best.dist) {
             best.dist = dist;
@@ -345,12 +443,17 @@ public final class ShipLeashPhysicsTick {
         }
     }
 
-    private static void maybeWarnBadAnchor(ServerPlayer p, UUID animalId, Vec3 knotPos, Vec3 capAnchor) {
+    private static void maybeWarnBadAnchor(ServerPlayer p, UUID animalId, Vec3 knotPos, Vec3 capAnchor, Vec3 fenceCenter, String reason) {
         int now = p.tickCount;
         int last = LAST_BAD_ANCHOR_TICK.getOrDefault(animalId, -999999);
         if (now - last < 40) return;
 
         LAST_BAD_ANCHOR_TICK.put(animalId, now);
+
+        if (DEBUG) {
+            LOGGER.warn("[ReinsMod] bad_anchor animal={} knotPos={} capAnchor={} fenceCenter={} reason={}",
+                    animalId, fmt(knotPos), fmt(capAnchor), fmt(fenceCenter), reason);
+        }
     }
 
     // Use true VS ship velocity (assumed world space, units likely blocks/sec). If unavailable, returns ZERO (safe).
@@ -365,6 +468,7 @@ public final class ShipLeashPhysicsTick {
         return Vec3.ZERO;
     }
 
+    @SuppressWarnings("unused")
     private static void cleanup(Animal animal) {
         UUID id = animal.getUUID();
         LAST_PULL_FORCE.remove(id);
@@ -374,16 +478,6 @@ public final class ShipLeashPhysicsTick {
             cap.setShipFencePos(null);
             cap.setShipAnchorPos(null);
         });
-    }
-
-    private static void debug(ServerPlayer p, String msg) {
-        if (p.tickCount % 10 == 0) {
-            p.sendSystemMessage(Component.literal("§7[ReinsDbg] " + msg));
-        }
-    }
-
-    private static String fmt(double d) {
-        return String.format("%.3f", d);
     }
 
     private static String fmt(Vec3 v) {
