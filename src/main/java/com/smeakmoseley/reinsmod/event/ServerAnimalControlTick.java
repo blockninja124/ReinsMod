@@ -73,10 +73,38 @@ public class ServerAnimalControlTick {
 
                 // If not holding whip, we only keep control if cruise is enabled (automatic mode).
                 if (!holdingWhip) {
+                    WHIP_WARNED_NO_SHIP.remove(player.getUUID());
                     ServerControlState.Control c = ServerControlState.get(player.getUUID());
                     if (c == null || !c.cruiseEnabled) {
                         ServerControlState.clear(player.getUUID());
                         continue;
+                    }
+                }
+
+                // If holding whip, require at least ONE owned reined animal that is ship-leashed.
+                // Otherwise: do nothing and show a one-time message per equip.
+                if (holdingWhip) {
+                    boolean anyShipLeashedOwned = level.getEntitiesOfClass(
+                            Animal.class,
+                            player.getBoundingBox().inflate(NEAR_SCAN_RADIUS)
+                    ).stream().anyMatch(animal -> animal.getCapability(ReinedAnimalProvider.CAPABILITY).map(cap ->
+                            cap.hasReins()
+                                    && player.getUUID().equals(cap.getOwner())
+                                    && cap.isLeashedToShip()
+                    ).orElse(false));
+
+                    if (!anyShipLeashedOwned) {
+                        boolean alreadyWarned = WHIP_WARNED_NO_SHIP.getOrDefault(player.getUUID(), false);
+                        if (!alreadyWarned) {
+                            WHIP_WARNED_NO_SHIP.put(player.getUUID(), true);
+                            player.sendSystemMessage(Component.literal("Leash your animal to a Valkyrien Skies ship to use reins!"));
+                        }
+                        // Prevent whip control when nothing is ship-leashed.
+                        ServerControlState.clear(player.getUUID());
+                        continue;
+                    } else {
+                        // Reset warning if they now have a valid setup.
+                        WHIP_WARNED_NO_SHIP.remove(player.getUUID());
                     }
                 }
 
@@ -114,7 +142,9 @@ public class ServerAnimalControlTick {
 
                         // Ensure still owned+reined
                         boolean ok = animal.getCapability(ReinedAnimalProvider.CAPABILITY)
-                                .map(cap -> cap.hasReins() && player.getUUID().equals(cap.getOwner()))
+                                .map(cap -> cap.hasReins()
+                                        && player.getUUID().equals(cap.getOwner())
+                                        && cap.isLeashedToShip())
                                 .orElse(false);
 
                         if (!ok) {
@@ -139,6 +169,9 @@ public class ServerAnimalControlTick {
                     animal.getCapability(ReinedAnimalProvider.CAPABILITY).ifPresent(cap -> {
                         if (!cap.hasReins()) return;
                         if (!player.getUUID().equals(cap.getOwner())) return;
+
+                        // ✅ Only ship-leashed animals respond to whip control
+                        if (!cap.isLeashedToShip()) return;
 
                         if (doRefresh) {
                             control.cruiseAnimalIds.add(animal.getUUID());
