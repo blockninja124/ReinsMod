@@ -5,6 +5,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.decoration.LeashFenceKnotEntity;
 import net.minecraft.world.phys.Vec3;
+import org.valkyrienskies.core.api.ships.Ship;
+import org.valkyrienskies.mod.common.VSGameUtilsKt;
 
 public final class ShipRopeConstraint {
 
@@ -49,7 +51,8 @@ public final class ShipRopeConstraint {
 
         // We use the knot position to locate the ship (this is world position)
         Vec3 knotWorldPos = knot.position();
-        Object ship0 = VsShipAccess.getShipManagingPos(level, knotWorldPos).orElse(null);
+
+        Ship ship0 = VSGameUtilsKt.getShipManagingPos(level, knotWorldPos);
         if (ship0 == null) return desiredMove;
 
         // Pick a sane anchorWorld using best-candidate logic
@@ -87,11 +90,11 @@ public final class ShipRopeConstraint {
      * Choose the candidate with smallest horizontal distance to the animal
      * that is also "reasonable".
      */
-    private static Vec3 chooseBestAnchorWorld(ServerLevel level, Object fallbackShip, Animal animal, Vec3 anchorRaw) {
+    private static Vec3 chooseBestAnchorWorld(ServerLevel level, Ship fallbackShip, Animal animal, Vec3 anchorRaw) {
         Vec3 animalPos = animal.position();
 
         // Candidate A: treat as shipyard -> world
-        Vec3 a = VsShipTransforms.shipyardToWorld(fallbackShip, anchorRaw);
+        Vec3 a = VSGameUtilsKt.toWorldCoordinates(fallbackShip, anchorRaw);
 
         // Candidate B: treat as already world
         Vec3 b = anchorRaw;
@@ -119,7 +122,7 @@ public final class ShipRopeConstraint {
         if (anchorWorld == null) return currentBest;
 
         // Ensure the anchorWorld is actually on/near a ship-managed region; if not, still allow fallbackShip
-        Object shipHere = VsShipAccess.getShipManagingPos(level, anchorWorld).orElse(fallbackShip);
+        Ship shipHere = VSGameUtilsKt.getShipManagingPos(level, anchorWorld);
         if (shipHere == null) return currentBest;
 
         Vec3 d = animalPos.subtract(anchorWorld);

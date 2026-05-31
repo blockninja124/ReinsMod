@@ -1,6 +1,7 @@
 package com.smeakmoseley.reinsmod;
 
 import com.mojang.logging.LogUtils;
+import com.smeakmoseley.reinsmod.client.ClientBootstrap;
 import com.smeakmoseley.reinsmod.item.ModItems;
 import com.smeakmoseley.reinsmod.network.NetworkHandler;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -22,16 +23,8 @@ public class ReinsMod {
         ModItems.register(modEventBus);
         NetworkHandler.init();
 
-        // ✅ Only attempt client bootstrap on client, and do it via reflection so the server never links client classes.
         if (FMLEnvironment.dist == Dist.CLIENT) {
-            try {
-                Class.forName("com.smeakmoseley.reinsmod.client.ClientBootstrap")
-                        .getMethod("init")
-                        .invoke(null);
-                LOGGER.info("[ReinsMod] ClientBootstrap initialized");
-            } catch (Throwable t) {
-                LOGGER.error("[ReinsMod] Failed to init client bootstrap", t);
-            }
+            ClientBootstrap.init();
         }
 
         LOGGER.info("[ReinsMod] Loaded");

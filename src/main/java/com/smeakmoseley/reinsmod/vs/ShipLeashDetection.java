@@ -6,6 +6,8 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.decoration.LeashFenceKnotEntity;
 import net.minecraft.world.phys.Vec3;
+import org.valkyrienskies.core.api.ships.Ship;
+import org.valkyrienskies.mod.common.VSGameUtilsKt;
 
 import java.util.Optional;
 
@@ -21,9 +23,9 @@ public class ShipLeashDetection {
         Vec3 knotPosRaw = knot.position();
 
         // Try both: knot pos and fence center
-        Object ship = VsShipAccess.getShipManagingPos(level, knotPosRaw).orElse(null);
+        Ship ship = VSGameUtilsKt.getShipManagingPos(level, knotPosRaw);
         if (ship == null) {
-            ship = VsShipAccess.getShipManagingPos(level, Vec3.atCenterOf(fencePos)).orElse(null);
+            ship = VSGameUtilsKt.getShipManagingPos(level, knotPosRaw);
         }
         if (ship == null) return Optional.empty();
 

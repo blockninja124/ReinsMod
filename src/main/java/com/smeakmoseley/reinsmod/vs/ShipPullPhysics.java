@@ -5,6 +5,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.decoration.LeashFenceKnotEntity;
 import net.minecraft.world.phys.Vec3;
+import org.valkyrienskies.core.api.ships.Ship;
+import org.valkyrienskies.mod.common.VSGameUtilsKt;
 
 public final class ShipPullPhysics {
 
@@ -31,11 +33,10 @@ public final class ShipPullPhysics {
 
         Vec3 anchorShipyard = knot.position();
 
-        Object ship = VsShipAccess.getShipManagingPos(level, anchorShipyard).orElse(null);
+        Ship ship = VSGameUtilsKt.getShipManagingPos(level, anchorShipyard);
         if (ship == null) return;
 
-        Vec3 anchorWorld = VsShipTransforms.shipyardToWorld(ship, anchorShipyard);
-        if (anchorWorld == null) return;
+        Vec3 anchorWorld = VSGameUtilsKt.toWorldCoordinates(ship, anchorShipyard);
 
         Vec3 delta = animal.position().subtract(anchorWorld);
         delta = new Vec3(delta.x, 0, delta.z);
