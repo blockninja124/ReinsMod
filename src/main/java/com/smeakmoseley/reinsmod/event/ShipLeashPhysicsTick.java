@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Mod.EventBusSubscriber(
         modid = ReinsMod.MODID,
@@ -116,7 +117,13 @@ public final class ShipLeashPhysicsTick {
         for (ServerPlayer player : level.players()) {
             AABB scan = player.getBoundingBox().inflate(SCAN_RADIUS);
 
+            AtomicBoolean skip = new AtomicBoolean(false);
             for (Animal animal : level.getEntitiesOfClass(Animal.class, scan)) {
+
+                // I don't know if this works or not but might aswell try
+                if (skip.get()) break;
+
+
                 if (!seen.add(animal.getId())) continue;
 
                 animal.getCapability(ReinedAnimalProvider.CAPABILITY).ifPresent(cap -> {
@@ -335,6 +342,7 @@ public final class ShipLeashPhysicsTick {
                                     ok, VsShipForces.resolutionSummary(), forceMag, solved.mode, dist);
                         }
                     }
+                    skip.set(true);
                 });
             }
         }
