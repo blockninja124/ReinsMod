@@ -50,7 +50,7 @@ public final class ShipLeashPhysicsTick {
 
     // Smooth + rate limit (pull force only)
     private static final double FORCE_SMOOTHING = 0.75;
-    private static final double MIN_FORCE_MASS_MULT = 2.0;
+    private static final double MIN_FORCE_MASS_MULT = 1.0;
     private static final double FORCE_RATE_LIMIT_MULT_LIGHT = 400.0;
     private static final double FORCE_RATE_LIMIT_MULT_HEAVY = 220.0;
 
@@ -166,7 +166,7 @@ public final class ShipLeashPhysicsTick {
                     Vec3 delta = animal.position().subtract(anchorWorld);
                     delta = new Vec3(delta.x, 0.0, delta.z);
                     double dist = delta.length();
-                    if (dist < 1.0e-6 || dist > MAX_REASONABLE_DIST) return;
+                    if (dist < 3 || dist > MAX_REASONABLE_DIST) return;
 
                     Vec3 dir = delta.scale(1.0 / dist);
 
@@ -206,13 +206,13 @@ public final class ShipLeashPhysicsTick {
 
                     double shipMass = 0;
                     if (ship instanceof ServerShip serverShip) {
-                        shipMass = serverShip.getInertiaData().getMass()*4;
+                        shipMass = serverShip.getInertiaData().getMass();
                     }
 
                     if (shipMass <= 0) shipMass = 20_000.0;
 
                     boolean cruiseEnabled = (ctl != null && ctl.cruiseEnabled);
-                    boolean hasDriveIntent = true;//cruiseEnabled || hasInput;
+                    boolean hasDriveIntent = cruiseEnabled || hasInput;
 
                     // Only brake when there is NO intent to move
                     if (!hasDriveIntent) {
@@ -299,7 +299,7 @@ public final class ShipLeashPhysicsTick {
                     double minForce = Math.max(1.0, shipMass * MIN_FORCE_MASS_MULT);
                     double targetForce = 0.0;
 
-                    if (playerControlled && (hasInput || ctl.cruiseEnabled)) {
+                    if (hasInput || ctl.cruiseEnabled) {
                         double shipTons = shipMass / 1000.0;
                         double intentBase = commandedSpeed * BASE_INTENT_FORCE_PER_TON;
                         double massFactor = Math.pow(shipTons, INTENT_FORCE_MASS_EXPONENT);
@@ -324,7 +324,7 @@ public final class ShipLeashPhysicsTick {
                     double maxDelta = shipMass * rateLimit;
                     double df = Math.max(-maxDelta, Math.min(maxDelta, smoothed - prevForce));
 
-                    double forceMag = Math.min(MAX_FORCE, Math.max(0.0, prevForce + df));
+                    double forceMag = Math.min(MAX_FORCE, Math.max(0.0, (prevForce + df)-1));
                     LAST_PULL_FORCE.put(key, forceMag);
 
                     if (forceMag > 0.0) {

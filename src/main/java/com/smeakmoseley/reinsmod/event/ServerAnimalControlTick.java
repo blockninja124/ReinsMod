@@ -30,7 +30,7 @@ public class ServerAnimalControlTick {
     // =====================
     // Movement tuning
     // =====================
-    private static final float WALK_SPEED = 0.20f;
+    private static final float WALK_SPEED = 0.05f;
     private static final float SPRINT_MULT = 1.80f;
 
     private static final float CONTROL_STEP = 1.0f;
